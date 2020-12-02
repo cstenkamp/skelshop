@@ -63,9 +63,10 @@ def process_options(options, allow_empty, kwargs):
         raise click.BadOptionUsage(
             "--pose-matcher-config", "--pose-matcher-config required when --track",
         )
-    if (not kwargs.get("track") and kwargs.get("shot_seg") != "none") or (
-        kwargs.get("track") and kwargs.get("shot_seg") == "none"
-    ):
+    if (
+        (not kwargs.get("track") and kwargs.get("shot_seg") != "none")
+        or (kwargs.get("track") and kwargs.get("shot_seg") == "none")
+    ) and not allow_empty:
         raise click.UsageError(
             "Cannot perform shot segmentation without tracking or visa-versa",
         )

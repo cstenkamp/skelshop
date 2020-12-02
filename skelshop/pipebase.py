@@ -47,7 +47,8 @@ class RewindStage(FilterStageBase):
         return next(self.rewindable)
 
     def rewind(self, iters):
-        self.rewind(iters)
+        assert False, "rewind is infinitely recursing!"
+        # self.rewind(iters)  # TODO this is infinite recursion
 
 
 class IterStage(PipelineStageBase):

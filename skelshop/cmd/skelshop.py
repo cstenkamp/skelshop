@@ -12,6 +12,7 @@ from .drawsticks import drawsticks
 from .dump import dump
 from .dumpimgs import dumpimgs
 from .filter import filter
+from .gestures import gestures
 from .playsticks import playsticks
 from .stats import stats
 
@@ -44,3 +45,4 @@ skelshop.add_command(stats)
 skelshop.add_command(bench)
 skelshop.add_command(calibrate)
 skelshop.add_command(dumpimgs)
+skelshop.add_command(gestures)
