@@ -2,12 +2,15 @@ import click
 import h5py
 from imutils.video.count_frames import count_frames
 
+from skelshop.config import conf
 from skelshop.dump import add_basic_metadata
-from skelshop.face.consts import DEFAULT_THRESH_POOL, DEFAULT_THRESH_VAL
 from skelshop.face.io import FaceWriter, write_faces
 from skelshop.io import AsIfSingleShot, ShotSegmentedReader
 from skelshop.utils.h5py import h5out
 from skelshop.utils.video import load_video_rgb
+
+DEFAULT_THRESH_VAL = conf.DEFAULT_THRESH_VALS["body"]
+DEFAULT_THRESH_POOL = conf.DEFAULT_THRESH_POOL
 
 EXTRACTORS = {
     "dlib-hog-face5": {"type": "dlib", "detector": "hog", "keypoints": "face5",},
@@ -29,11 +32,9 @@ EXTRACTORS = {
 @click.option("--from-skels", type=click.Path())
 @click.option("--start-frame", type=int, default=0)
 @click.option(
-    "--skel-thresh-pool",
-    type=click.Choice(["min", "max", "mean"]),
-    default=DEFAULT_THRESH_POOL,
+    "--skel-thresh-pool", type=click.Choice(["min", "max", "mean"]), default=None,
 )
-@click.option("--skel-thresh-val", type=float, default=DEFAULT_THRESH_VAL)
+@click.option("--skel-thresh-val", type=float, default=None)
 @click.option("--batch-size", type=int)
 @click.option("--write-bboxes/--no-write-bboxes")
 @click.option("--write-chip/--no-write-chip")
@@ -52,6 +53,8 @@ def embedall(
     """
     Create a HDF5 face dump from a video using dlib.
     """
+    skel_thresh_pool = skel_thresh_pool or DEFAULT_THRESH_POOL
+    skel_thresh_val = skel_thresh_val or DEFAULT_THRESH_VAL
     from skelshop.face.pipe import (
         FaceExtractionMode,
         iter_faces_from_dlib,
@@ -89,6 +92,11 @@ def embedall(
             )
         else:
             skels_h5 = h5py.File(from_skels, "r")
+            if skels_h5.attrs.get("fmt_type") != "trackshots":
+                raise click.BadOptionUsage(
+                    "--from-skels",
+                    f"--from-skels needs an h5-file of type 'trackshots', got '{skels_h5.attrs.get('fmt_type')}'!",
+                )
             skel_read = AsIfSingleShot(ShotSegmentedReader(skels_h5, infinite=False))
             if extractor_info["keypoints"] == "face68":
                 mode = FaceExtractionMode.FROM_FACE68_IN_BODY_25_ALL

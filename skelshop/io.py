@@ -232,8 +232,8 @@ class ShotSegmentedReader:
         yields empty pose bundles.
         """
         self.h5f = h5f
-        self.limbs = self.h5f.attrs["limbs"]
-        assert self.h5f.attrs["fmt_type"] == "trackshots"
+        self.limbs = self.h5f.attrs.get("limbs")
+        assert self.h5f.attrs.get("fmt_type") == "trackshots"
         self.mk_bundle = partial(bundle_cls, cls=POSE_CLASSES[self.h5f.attrs["mode"]])
         self.empty_bundle = self.mk_bundle({})
         self.infinite = infinite

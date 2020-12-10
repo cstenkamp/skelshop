@@ -8,16 +8,15 @@ from numpy.linalg import norm
 from ufunclab import minmax
 
 from skelshop import lazyimp
+from skelshop.config import conf
 from skelshop.skelgraphs.openpose import BODY_25_JOINTS, FACE_IN_BODY_25_ALL_REDUCER
 from skelshop.utils.dlib import rect_to_x1y1x2y2, to_dpoints, to_full_object_detections
 from skelshop.utils.geom import rnd
 
-from .consts import (
-    DEFAULT_FACES_BATCH_SIZE,
-    DEFAULT_FRAME_BATCH_SIZE,
-    DEFAULT_THRESH_POOL,
-    DEFAULT_THRESH_VAL,
-)
+from .consts import DEFAULT_FACES_BATCH_SIZE, DEFAULT_FRAME_BATCH_SIZE
+
+DEFAULT_THRESH_VAL = conf.DEFAULT_THRESH_VALS["body"]
+DEFAULT_THRESH_POOL = conf.DEFAULT_THRESH_POOL
 
 if TYPE_CHECKING:
     import dlib
@@ -251,7 +250,9 @@ def iter_faces_from_dlib(
         )
 
 
-def mk_conf_thresh(thresh_pool=DEFAULT_THRESH_POOL, thresh_val=DEFAULT_THRESH_VAL):
+def mk_conf_thresh(thresh_pool=None, thresh_vals=None):
+    thresh_vals = thresh_vals or DEFAULT_THRESH_VAL
+    thresh_pool = thresh_pool or DEFAULT_THRESH_POOL
     if thresh_pool == "min":
         func = np.min
     elif thresh_pool == "max":
@@ -261,8 +262,8 @@ def mk_conf_thresh(thresh_pool=DEFAULT_THRESH_POOL, thresh_val=DEFAULT_THRESH_VA
     else:
         assert False
 
-    def inner(arr):
-        return func(arr) >= thresh_val
+    def inner(arr, bodypart="body"):
+        return func(arr) >= thresh_vals[bodypart]
 
     return inner
 
@@ -374,10 +375,12 @@ def iter_faces_from_skel(
     batch_size=DEFAULT_FACES_BATCH_SIZE,
     include_chip=False,
     include_bboxes=False,
-    thresh_pool=DEFAULT_THRESH_POOL,
-    thresh_val=DEFAULT_THRESH_VAL,
+    thresh_pool=None,
+    thresh_val=None,
     mode=FaceExtractionMode.FROM_FACE68_IN_BODY_25_ALL,
 ):
+    thresh_val = thresh_val or DEFAULT_THRESH_VAL
+    thresh_pool = thresh_pool or DEFAULT_THRESH_POOL
     frame_skels = zip(vid_read, skel_read)
     while 1:
         batch_fods: FullObjectDetectionsBatch

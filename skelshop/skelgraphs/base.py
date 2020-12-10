@@ -42,14 +42,17 @@ class SkeletonType:
     def adj_ordered(self, idx):
         return self.digraph[idx]
 
-    def iter_limbs(self, kps, kp_idxs=None):
+    def iter_limbs(self, kps, kp_idxs=None, gen_id=False):
         if kp_idxs is None:
             kp_idxs = range(self.max_kp)
         for idx in kp_idxs:
             for other_idx in self.digraph.get(idx, set()):
                 if other_idx not in kp_idxs:
                     continue
-                yield kps[idx], kps[other_idx]
+                if gen_id:
+                    yield idx, (kps[idx], kps[other_idx])
+                else:
+                    yield kps[idx], kps[other_idx]
 
     def iter_limb_pairs(self, kps, kp_idxs=None):
         if kp_idxs is None:

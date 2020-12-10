@@ -320,6 +320,7 @@ class SegPlayer(PlayerBase):
         pass
 
     def draw_cur(self, img):
+        print([min(i[:, 2][i[:, 2] > 0]) for i in self.cur_skel().bundle.values()])
         self.skel_draw.draw_bundle(img, self.cur_skel())
 
     def cur_skel(self):
