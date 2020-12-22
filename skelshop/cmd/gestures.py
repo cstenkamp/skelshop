@@ -33,15 +33,11 @@ def debug_screen(size):
     yield screen
 
 
-def show_frame(frame, screen, skel_h5f=None):
+def show_frame(frame, screen, skel_h5f):
     img = np.ones((*FORMAT, 3))
-    if skel_h5f:
-        posetrack = False  # TODO is posetrack False?!
-        skel = get_skel(skel_h5f, False)
-        skel_draw = SkelDraw(skel, posetrack, ann_ids=True, scale=1)
-    else:
-        posetrack = False  # TODO is posetrack False?!
-        skel_draw = SkelDraw(frame.cls, posetrack, ann_ids=True, scale=1)
+    posetrack = False  # TODO is posetrack False?!
+    skel = get_skel(skel_h5f, False)
+    skel_draw = SkelDraw(skel, posetrack, ann_ids=True, scale=1)
     skel_draw.draw_bundle(img, frame)
     img = (img * 255).astype(np.uint8)
     imdisplay(img, screen)
@@ -50,6 +46,10 @@ def show_frame(frame, screen, skel_h5f=None):
 
 
 # ########### end that ################
+
+# bewegt sich was, ist die Hand drauf, #Personen begrenzen (Mahnaz-Talk)
+# im video einblenden ob geste erkannt ist oder nicht (video dimmen?)
+# er wird mir code zukommen lassen (trian taphylos) -> "velocity from keypoints"
 
 
 @click.command()
@@ -109,13 +109,6 @@ def gestures(h5infn, pipeline, start_frame, end_frame):
                             tmp3.get(i, (np.array((0, 0, 0)), None))[0]
                             for i in range(len(kps))
                         ]
-                        # show_frame(h5) -> get_skel_draw(h5).draw_bundle(..) -> SkelDraw( get_skel() -> MODE_SKELS[mode] ).draw_bundle(..).
-                        #   -> to draw I need to make this a SkeletonType.
-                        # draw_skel (what REALLY draws it) gets numarr, which are the keypoints. draw_skel gets called by draw_bundle, which needs a bundle which is "frame" here.
-                        # ... that means I need to remove the respective keypoints from the DumpReaderPoseBundle.bundle[pers_id] here.
-
-                        # frame.bundle[num] = skel #PoseBody25All
-                        # BODY_IN_BODY_25_ALL_REDUCER.sparse_skel is SkeletonType and has lines_flat etc
                     frame.bundle[num] = skel.__class__.from_parts(
                         parts["body"],
                         parts["left hand"],
@@ -123,7 +116,5 @@ def gestures(h5infn, pipeline, start_frame, end_frame):
                         parts["face"],
                     ).keypoints
                     # TODO this only holds if skel.__class__ is Body25All
-
-                # show_frame(frame, screen)
 
                 show_frame(frame, screen, skel_h5f=skel_h5f)
