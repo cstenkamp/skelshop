@@ -25,6 +25,11 @@ from skelshop.skelgraphs.openpose import (
     RHAND_IN_BODY_25_ALL_REDUCER,
 )
 
+# from skelshop.config import set_conf, DefaultConf
+# new_conf = DefaultConf()
+# new_conf.DEFAULT_THRESH_VALS['body'] = 0.2
+# set_conf(new_conf)
+
 BUFFER_SIZE = 10
 
 # ######### debug: show skels ##############
