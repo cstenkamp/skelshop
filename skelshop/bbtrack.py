@@ -6,7 +6,7 @@ from .pose import IdPoseBundle
 
 class TrackStage(FilterStageBase):
     """
-    A pipeline stage wrapping the `skelshop.track.PoseTrack` generic approach
+    A pipeline stage wrapping the `skelshop.track.track.PoseTrack` generic approach
     to distance-based tracking.
     """
 

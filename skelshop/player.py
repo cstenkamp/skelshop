@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from itertools import repeat
 
 import cv2
+import numpy as np
 import opencv_wrapper as cvw
 import pygame as pg
 from more_itertools import peekable
@@ -16,6 +17,9 @@ from .utils.iter import RewindableIter
 
 
 def imdisplay(imarray, screen):
+    assert (
+        imarray.dtype == np.uint8
+    ), "The imarray must be unsigned integer!"  # .kind in np.typecodes["UnsignedInteger"]
     a = pg.surfarray.make_surface(
         cv2.cvtColor(imarray, cv2.COLOR_BGR2RGB).swapaxes(0, 1)
     )
