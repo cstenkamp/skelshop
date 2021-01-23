@@ -4,9 +4,10 @@ import logging
 import os
 from contextlib import ExitStack
 from functools import wraps
+from math import sqrt
 from os.path import join as pjoin
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, Iterator, List, Tuple
 
 import click
 from scipy.spatial.distance import cdist
@@ -22,22 +23,63 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Each pixel takes ~1k RAM in the detector. So this bounds memory
+# usage at ~7GiB
+MAX_IMAGE_PIXELS = 7000000
+
+
+def dlib_detect_safe(face_image):
+    """
+    Run dlib detection, scaling down big images so avoid using too
+    much (V)RAM.
+    """
+    from cv2 import INTER_AREA, resize
+    from dlib import rectangle
+
+    from skelshop.face.pipe import dlib_detect
+
+    height, width = face_image.shape[:2]
+    face_pixels = width * height
+    scale_factor = 1
+    if face_pixels > MAX_IMAGE_PIXELS:
+        # Ceiling division
+        scale_factor = int(-(sqrt(face_pixels) // -sqrt(MAX_IMAGE_PIXELS)))
+        face_image = resize(
+            face_image,
+            (width // scale_factor, height // scale_factor),
+            interpolation=INTER_AREA,
+        )
+    image_batch = [face_image]
+    face_locations = dlib_detect("cnn", image_batch)
+    if scale_factor > 1:
+        return [
+            rectangle(
+                scale_factor * rect.left(),
+                scale_factor * rect.top(),
+                scale_factor * rect.right(),
+                scale_factor * rect.bottom(),
+            )
+            for rect in face_locations[0]
+        ]
+    else:
+        return face_locations[0]
+
+
 def dlib_face_encodings(face_image):
-    from skelshop.face.pipe import DlibFodsBatch, dlib_detect, get_dlib_pose_predictor
+    from skelshop.face.pipe import DlibFodsBatch, get_dlib_pose_predictor
 
     # Possible TODO: batching
 
     pose_predictor = get_dlib_pose_predictor("face68")
-    image_batch = [face_image]
-    face_locations = dlib_detect("cnn", image_batch)
+    face_locations = dlib_detect_safe(face_image)
     batch_fods = DlibFodsBatch()
     frame_shape_predictions = []
-    for image_face_location in face_locations[0]:
+    for image_face_location in face_locations:
         frame_shape_predictions.append(pose_predictor(face_image, image_face_location))
     if not frame_shape_predictions:
         return []
     batch_fods.append_fods(frame_shape_predictions)
-    return batch_fods.compute_face_descriptor(image_batch)[0]
+    return batch_fods.compute_face_descriptor([face_image])[0]
 
 
 def ref_embeddings(ref_dir: Path, strict=False) -> List[np.ndarray]:
@@ -82,17 +124,22 @@ def min_dist(metric, ref, embed) -> float:
 
 class ReferenceEmbeddings:
     refs: Dict[str, np.ndarray]
-    ref_embeddings: Optional[List[np.ndarray]]
-    ref_group_sizes: Optional[List[int]]
-    ref_labels: Optional[List[str]]
+    ref_embeddings: List[np.ndarray]
+    ref_group_sizes: List[int]
+    ref_labels: List[str]
 
     def __init__(self, ref_it: Iterator[Tuple[str, Iterable[np.ndarray]]]):
         self.refs = {}
+        self.ref_embeddings = []
+        self.ref_group_sizes = []
+        self.ref_labels = []
         for label, entry in ref_it:
             self.refs[label] = entry
-        self.ref_embeddings = None
-        self.ref_group_sizes = None
-        self.ref_labels = None
+            old_ref_embeddings_len = len(self.ref_embeddings)
+            self.ref_embeddings.extend(entry)
+            entry_len = len(self.ref_embeddings) - old_ref_embeddings_len
+            self.ref_group_sizes.append(entry_len)
+            self.ref_labels.append(label)
 
     def num_refs(self) -> int:
         return len(self.refs)
@@ -118,21 +165,9 @@ class ReferenceEmbeddings:
                 min_dist = dist
         return min_label, min_dist
 
-    def _ensure_cdist(self):
-        if self.ref_embeddings is not None:
-            return
-        self.ref_embeddings = []
-        self.ref_group_sizes = []
-        self.ref_labels = []
-        for label, embeddings in self.refs.items():
-            self.ref_embeddings.extend(embeddings)
-            self.ref_group_sizes.append(len(embeddings))
-            self.ref_labels.append(label)
-
     def cdist(self, metric: str, cmp_np, cmp_group_sizes=None):
         from scipy.spatial.distance import cdist
 
-        self._ensure_cdist()
         if cmp_group_sizes is None:
             cmp_group_sizes = [1] * len(cmp_np)
         dists = cdist(self.ref_embeddings, cmp_np, metric=metric)

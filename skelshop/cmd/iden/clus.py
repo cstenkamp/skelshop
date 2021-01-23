@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import os
+import pickle
 from collections import Counter
 from functools import partial
 from itertools import groupby
+from operator import itemgetter
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import click
@@ -15,7 +17,6 @@ from more_itertools import ilen, peekable
 from scipy.spatial.distance import pdist, squareform
 from sklearn.utils.random import sample_without_replacement
 
-from skelshop.cluster.knn import FaissIndex
 from skelshop.corpus import CorpusReader
 from skelshop.face.consts import DEFAULT_DETECTION_THRESHOLD, DEFAULT_METRIC
 from skelshop.face.io import SparseFaceReader
@@ -46,8 +47,9 @@ SAMPLE_BATCH_SIZE = 1024
 #    all_embeddings.extend(embeddings)
 
 
-def read_seg_pers(corpus: CorpusReader):
-    seg_pers = []
+def read_seg_pers(corpus: CorpusReader, num_embeddings) -> np.ndarray:
+    seg_pers = np.empty((num_embeddings, 3), dtype=np.int32)
+    idx = 0
     for video_idx, video_info in enumerate(corpus):
         with open(video_info["bestcands"], "r") as bestcands:
             next(bestcands)
@@ -59,13 +61,14 @@ def read_seg_pers(corpus: CorpusReader):
                     abs_frame_num,
                     extractor,
                 ) = line.strip().split(",")
-                seg_pers.append((video_idx, seg, pers_id))
+                seg_pers[idx] = (video_idx, int(seg), int(pers_id))
+                idx += 1
     return seg_pers
 
 
-def corpus_reader_indices(corpus):
+def corpus_reader_indices(corpus, msg="Loading"):
     for video_info in corpus:
-        logger.debug("Loading embeddings from", video_info["faces"])
+        logger.debug("%s embeddings from %s", msg, video_info["faces"])
         with h5py.File(video_info["faces"], "r") as face_h5f:
             face_reader = SparseFaceReader(face_h5f)
             for idx in range(len(face_reader)):
@@ -86,7 +89,7 @@ def collect_embeddings(corpus: CorpusReader, sample_size=None):
     os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
     shape, dtype = corpus_embedding_fmt(corpus)
     logger.debug("Counting total number of embeddings")
-    total_num_embeddings = ilen(corpus_reader_indices(corpus))
+    total_num_embeddings = ilen(corpus_reader_indices(corpus, msg="Counting"))
     logger.debug("Got %d", total_num_embeddings)
     if sample_size is None:
         logger.debug("Loading all of them...")
@@ -136,9 +139,9 @@ def num_to_clus(num: int):
     return f"c{num}"
 
 
-def get_seg_clusts_vote(seg_pers: List[Tuple[str, str, str]], label_it: Iterator[int]):
-    for grp, seg_pers_label in groupby(zip(seg_pers, label_it), lambda tpl: tpl[0]):
-        label_cnts = Counter((label for _, label in seg_pers_label))
+def get_seg_clusts_vote(seg_pers: np.ndarray, label_it: Iterator[int]):
+    for grp, seg_pers_label in groupby(zip(*seg_pers.T, label_it), itemgetter(0, 1, 2)):
+        label_cnts = Counter((label for _, _, _, label in seg_pers_label))
         clus: str
         if len(label_cnts) == 1:
             clus = num_to_clus(next(iter(label_cnts)))
@@ -178,7 +181,7 @@ def medoid_vecs(vecs, metric, n=1):
     return np.argsort(dists.sum(axis=0))[:n]
 
 
-def get_prototypes(all_embeddings_np, clus_labels, metric, n):
+def get_medioid_prototypes(all_embeddings_np, clus_labels, metric, n):
     idx = 0
     while 1:
         clus_idxs = np.nonzero(clus_labels == idx)[0]
@@ -190,14 +193,24 @@ def get_prototypes(all_embeddings_np, clus_labels, metric, n):
         idx += 1
 
 
-def write_prototypes(protof, corpus, all_embeddings_np, clus_labels, metric, n):
+def get_rnn_prototypes(rev_knns, clus_labels, n):
+    idx = 0
+    while 1:
+        clus_idxs = np.nonzero(clus_labels == idx)[0]
+        if not len(clus_idxs):
+            break
+        subgraph = rev_knns[clus_idxs][:, clus_idxs]
+        max_rnn_idxs = np.flip(np.argsort(subgraph.getnnz(1)))[:n]
+        yield idx, (clus_idxs[idx] for idx in max_rnn_idxs)
+        idx += 1
+
+
+def write_prototypes(protof, corpus, prototypes):
     protof.write("clus_idx,video_idx,frame_num,pers_id\n")
     face_sorted = sorted(
         (
             (face_idx, clus_idx)
-            for clus_idx, face_idxs in get_prototypes(
-                all_embeddings_np, clus_labels, metric, n
-            )
+            for clus_idx, face_idxs in prototypes
             for face_idx in face_idxs
         )
     )
@@ -284,6 +297,7 @@ def mk_count_vote(min_samples):
 
 
 def expand_clus_labels(
+    transformer_cls,
     corpus,
     num_embeddings_total,
     *sampled_embeddings,
@@ -295,7 +309,8 @@ def expand_clus_labels(
 ):
     all_clus_labels = np.full(num_embeddings_total, -1)
     sampled_labels_it = iter(sampled_labels)
-    index = FaissIndex(sampled_embeddings, metric)
+    index = transformer_cls(SAMPLE_KNN, metric=metric)
+    index.fit(sampled_embeddings)
     del sampled_embeddings
     sample_indices_peek = peekable(sample_idxs)
     batch: List[np.ndarray] = []
@@ -305,7 +320,7 @@ def expand_clus_labels(
 
     def flush_batch():
         batch_np = np.vstack(batch)
-        dists, nbrs = index.search(batch_np, k=SAMPLE_KNN)
+        dists, nbrs = index.transform(batch_np)
         # Convert sims -> dists
         dists = 1 - dists
         # Mask out those over dist
@@ -334,23 +349,37 @@ def expand_clus_labels(
     return all_clus_labels
 
 
+def regroup_by_pers(all_embeddings_np, seg_pers):
+    indices = np.lexsort(seg_pers.T[::-1])
+    seg_pers[:] = seg_pers[indices]
+    all_embeddings_np[:] = all_embeddings_np[indices]
+
+
 def process_common_clus_options(args, kwargs, inner):
     corpus_desc = kwargs.pop("corpus_desc")
     corpus_base = kwargs.pop("corpus_base")
     proto_out = kwargs.pop("proto_out")
+    model_out = kwargs.pop("model_out")
     num_protos = kwargs.pop("num_protos")
     pool = kwargs["pool"]
+    ann_lib = kwargs["ann_lib"]
+    knn = kwargs.get("knn")
+    if model_out is not None and ann_lib != "pynndescent" and knn is not None:
+        raise click.UsageError("Model saving is only supported for pynndescent")
     with CorpusReader(corpus_desc, corpus_base) as corpus:
         kwargs["corpus"] = corpus
         sample_idxs = None
-        if "sample_size" in kwargs:
-            sample_size = kwargs.pop("sample_size")
+        sample_size = kwargs.pop("sample_size")
+        if sample_size is not None:
             num_embeddings, sample_idxs, all_embeddings_np = collect_embeddings(
                 corpus, sample_size
             )
         else:
             all_embeddings_np = collect_embeddings(corpus)
-        knn = kwargs.get("knn")
+            num_embeddings = len(all_embeddings_np)
+        seg_pers = read_seg_pers(corpus, num_embeddings)
+        regroup_by_pers(all_embeddings_np, seg_pers)
+        kwargs["seg_pers"] = seg_pers
         if knn is not None and knn > len(all_embeddings_np) - 1:
             knn = len(all_embeddings_np) - 1
             logging.info(
@@ -359,26 +388,33 @@ def process_common_clus_options(args, kwargs, inner):
                 knn,
             )
             kwargs["knn"] = knn
-        seg_pers = read_seg_pers(corpus)
-        kwargs["seg_pers"] = seg_pers
         if pool == "med":
+            if sample_size is not None:
+                raise click.UsageError("Cannot use sampling when --pool=med")
             all_embeddings_np = med_pool_vecs(
                 all_embeddings_np, seg_pers, DEFAULT_METRIC
             )
         kwargs["all_embeddings_np"] = all_embeddings_np
-        clus_labels, eps, min_samples = inner(*args, **kwargs)
+        estimator, clus_labels, eps, min_samples = inner(*args, **kwargs)
         if proto_out:
             with open(proto_out, "w") as protof:
+                if knn is not None and ann_lib == "pynndescent":
+                    rev_knns = estimator.named_steps["rnndbscan"].rev_knns_
+                    prototypes = get_rnn_prototypes(rev_knns, clus_labels, num_protos)
+                else:
+                    prototypes = get_medioid_prototypes(
+                        all_embeddings_np, clus_labels, DEFAULT_METRIC, num_protos
+                    )
                 write_prototypes(
-                    protof,
-                    corpus,
-                    all_embeddings_np,
-                    clus_labels,
-                    DEFAULT_METRIC,
-                    num_protos,
+                    protof, corpus, prototypes,
                 )
+        if model_out:
+            with open(model_out, "wb") as modelf:
+                pickle.dump(estimator, modelf)
         if sample_idxs is not None:
+            transformer_cls = knn_lib_transformer(ann_lib)
             clus_labels = expand_clus_labels(
+                transformer_cls,
                 corpus,
                 num_embeddings,
                 sampled_embeddings=all_embeddings_np,
@@ -400,8 +436,16 @@ common_clus_options = save_options(
         click.argument("corpus_desc", type=PathPath(exists=True)),
         click.option("--corpus-base", type=PathPath(exists=True)),
         click.option("--proto-out", type=PathPath()),
+        click.option("--model-out", type=PathPath()),
         click.option("--num-protos", type=int, default=1),
-        click.option("--algorithm", type=click.Choice(["dbscan", "optics-dbscan"])),
+        click.option(
+            "--algorithm", type=click.Choice(["dbscan", "optics-dbscan", "rnn-dbscan"])
+        ),
+        click.option(
+            "--ann-lib",
+            type=click.Choice(["pynndescent", "faiss-exact"]),
+            default="pynndescent",
+        ),
         click.option(
             "--pool", type=click.Choice(["med", "min", "vote"]), default="vote"
         ),
@@ -421,10 +465,24 @@ def clus():
     pass
 
 
-def get_clus_alg(algorithm: str, knn: Optional[int], pool: str, metric: str, **kwargs):
-    from sklearn.cluster import DBSCAN, OPTICS
+def knn_lib_transformer(knn_lib):
+    if knn_lib == "faiss-exact":
+        from sklearn_ann.kneighbors.faiss import FAISSTransformer
 
-    from skelshop.cluster.dbscan import KnnDBSCAN
+        return FAISSTransformer
+    else:
+        from sklearn_ann.kneighbors.pynndescent import PyNNDescentTransformer
+
+        return PyNNDescentTransformer
+
+
+def get_clus_alg(
+    algorithm: str, knn_lib: str, knn: Optional[int], pool: str, metric: str, **kwargs
+):
+    from sklearn.cluster import DBSCAN, OPTICS
+    from sklearn_ann.cluster.rnn_dbscan import simple_rnn_dbscan_pipeline
+
+    from skelshop.cluster.dbscan import knn_dbscan_pipeline
 
     if knn is None:
         metric = "precomputed" if pool == "min" else metric
@@ -435,16 +493,22 @@ def get_clus_alg(algorithm: str, knn: Optional[int], pool: str, metric: str, **k
                 cluster_method="dbscan",
                 **kwargs,
             )
-        else:
+        elif algorithm == "dbscan":
             return DBSCAN(metric=metric, **kwargs)
+        else:
+            raise click.UsageError("Must specify knn when algorithm == 'rnn-dbscan'")
     else:
         if algorithm == "optics-dbscan":
             raise NotImplementedError("KNN is not implemented for OPTICS")
         if pool == "min":
-            raise NotImplementedError("Min pooling not implemented for KNN DBSCAN")
-        return KnnDBSCAN(
-            knn=knn, th_sim=0.0, knn_method="faiss", metric=metric, **kwargs
-        )
+            raise NotImplementedError("Min pooling not implemented for KNN DBSCANs")
+        transformer = knn_lib_transformer(knn_lib)
+        if algorithm == "dbscan":
+            return knn_dbscan_pipeline(transformer, knn, metric=metric)
+        else:
+            return simple_rnn_dbscan_pipeline(
+                transformer, knn, metric=metric, keep_knns=True
+            )
 
 
 def proc_data(vecs, seg_pers: List[Tuple[str, str, str]], pool: str, metric: str):
@@ -465,6 +529,7 @@ def fixed(
     corpus: CorpusReader,
     seg_pers: List[Tuple[str, str, str]],
     algorithm: str,
+    ann_lib: str,
     pool: str,
     knn: Optional[int],
     eps: float,
@@ -476,6 +541,7 @@ def fixed(
     """
     clus_alg = get_clus_alg(
         algorithm,
+        ann_lib,
         knn,
         pool,
         DEFAULT_METRIC,
@@ -483,11 +549,13 @@ def fixed(
         min_samples=min_samples,
         n_jobs=n_jobs,
     )
+    labels = clus_alg.fit_predict(
+        proc_data(all_embeddings_np, seg_pers, pool, DEFAULT_METRIC)
+    )
     with maybe_ray():
         return (
-            clus_alg.fit_predict(
-                proc_data(all_embeddings_np, seg_pers, pool, DEFAULT_METRIC)
-            ),
+            clus_alg,
+            labels,
             eps,
             min_samples,
         )
@@ -521,6 +589,7 @@ def search(
     corpus: CorpusReader,
     seg_pers: List[Tuple[str, str, str]],
     algorithm: str,
+    ann_lib: str,
     pool: str,
     knn: Optional[int],
     eps: Optional[str],
@@ -568,7 +637,9 @@ def search(
         logger.debug("Using JOBLIB_CACHE_DIR=%s", os.environ["JOBLIB_CACHE_DIR"])
         clus_kwargs["memory"] = os.environ["JOBLIB_CACHE_DIR"]
 
-    clus_alg = get_clus_alg(algorithm, knn, pool, DEFAULT_METRIC, **clus_kwargs)
+    clus_alg = get_clus_alg(
+        algorithm, ann_lib, knn, pool, DEFAULT_METRIC, **clus_kwargs
+    )
 
     param_grid: Dict[str, List[Any]] = {
         "min_samples": min_samples_list,
@@ -613,6 +684,7 @@ def search(
     predicted_labels = grid_search.best_estimator_.labels_
 
     return (
+        grid_search.best_estimator_,
         predicted_labels,
         grid_search.best_params_["eps"],
         grid_search.best_params_["min_samples"],
