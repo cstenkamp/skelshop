@@ -1,8 +1,9 @@
 import time
+from collections import namedtuple
 from contextlib import contextmanager
 from functools import reduce
 from itertools import repeat
-from typing import Any, Callable, Deque, Dict, Iterable, List, cast
+from typing import Any, Callable, Deque, Dict, Iterable, Iterator, List, Tuple, cast
 
 import click
 import h5py
@@ -17,6 +18,7 @@ from skelshop.io import ShotSegmentedReader
 from skelshop.pipebase import IterStage
 from skelshop.pipeline import pipeline_options
 from skelshop.player import imdisplay
+from skelshop.pose import PoseBase
 from skelshop.skelgraphs.openpose import (
     BODY_IN_BODY_25_ALL_REDUCER,
     FACE_IN_BODY_25_ALL_REDUCER,
@@ -27,10 +29,11 @@ from skelshop.skelgraphs.openpose import (
 
 # from skelshop.config import set_conf, DefaultConf
 # new_conf = DefaultConf()
-# new_conf.DEFAULT_THRESH_VALS['body'] = 0.2
+# new_conf.DEFAULT_THRESH_VALS['body'] = 0.9
 # set_conf(new_conf)
 
-BUFFER_SIZE = 10
+BUFFER_SIZE = 200
+MAX_BODIES = 2
 
 # ######### debug: show skels ##############
 
@@ -68,19 +71,39 @@ def maybe_load(vid_in):
 
 
 class Body:
-    def __init__(self, skel_h5f, num):
+    def __init__(self, skel_h5f, num, max_buffer=0):
         self.skel_h5f = skel_h5f
         self.num = num
         self.skel = MODE_SKELS[skel_h5f.attrs["mode"]]
+        self.max_buffer = max_buffer
+        self.visible_at = set()
+        if max_buffer:
+            self.buffer = Deque[np.array](maxlen=self.max_buffer)
 
-    def update_numarr(self, numarr):
+    def update_numarr(self, numarr, framenum):
+        self.visible_at.add(framenum)
         self.numarr = numarr
+        if self.max_buffer:
+            self.buffer.append(numarr)
 
-    def get(self, name):
-        return self.numarr[self.skel.names.index(name)]
+    def get(self, name, numarr=None):
+        numarr = numarr if numarr is not None else self.numarr
+        return numarr[self.skel.names.index(name)]
 
-
-FrameBuf = Deque[List[Body]]
+    def check_gestures(self):
+        """checks if in the frame at self.max_buffer//2 there was a gesture"""
+        if len(self.buffer) < self.max_buffer:
+            return False
+        for bodypart in ["left wrist", "right wrist"]:
+            movement = sum(
+                [
+                    self.get(bodypart, numarr=i)[:2]
+                    - self.get(bodypart, numarr=self.buffer[self.max_buffer // 2])[:2]
+                    for i in self.buffer
+                ]
+            )
+            if min(movement) > 3:  # type: ignore
+                return True
 
 
 @click.command()
@@ -94,7 +117,11 @@ def gestures(h5infn, pipeline, vid_in, start_frame, end_frame):
     """
     Detect gestures on sorted etc data.
     """
-    buffer = FrameBuf(maxlen=BUFFER_SIZE)
+
+    class FakeFrame(namedtuple("Frame", "bundle cls")):
+        def __iter__(self) -> Iterator[Tuple[int, "PoseBase"]]:
+            for idx, pose in self.bundle.items():
+                yield idx, self.cls.from_keypoints(pose)
 
     if pipeline.metadata.get("shot_seg") == "none":
         raise click.BadOptionUsage("--shot-seg", "--shot-seg is required!")
@@ -116,40 +143,100 @@ def gestures(h5infn, pipeline, vid_in, start_frame, end_frame):
         conf_thresh = mk_conf_thresh(conf.DEFAULT_THRESH_POOL, conf.DEFAULT_THRESH_VALS)
         # skel_type = MODE_SKELS[skel_h5f.attrs["mode"]]; [i for i in skel_type.iter_limbs(posture)]
         bodies = []
-        for i in range(2):  # TODO get that number from the skeletons
-            bodies.append(Body(skel_h5f, i))
-        for scene in frame_iter:
-            for frame in scene:
-                img = (next(vid_iter) * 0.3).astype(np.uint8)
+
+        nframe_before_scene = 0
+        nframe = 0
+
+        for nscene, scene in enumerate(frame_iter):
+
+            print(f"Scene #{nscene+1} at {nframe}")
+            # in every new scene, start anew with the bodies
+            bodies = [
+                Body(skel_h5f, i, max_buffer=BUFFER_SIZE) for i in range(MAX_BODIES)
+            ]  # TODO get that number from the skeletons
+            if BUFFER_SIZE > 0:
+                # if we have a buffer, we also need to delay displaying the video
+                img_delay_buffer = Deque[np.array](maxlen=BUFFER_SIZE // 2)
+            newscene = True
+
+            for nframe_in_scene, frame in enumerate(scene):
+                nframe = nframe_before_scene + nframe_in_scene
+                img = (next(vid_iter) * 0.3).astype(
+                    np.uint8
+                )  # background scene should be dimmed
                 for num, skel in frame:
-                    bodies[num].update_numarr(threshold_limbs(skel, conf_thresh))
+                    bodies[num].update_numarr(
+                        threshold_limbs(skel, conf_thresh), nframe
+                    )
                     frame.bundle[num] = bodies[num].numarr
-                    if num > 0:  # TODO delete this
-                        break
                 # bewegt sich was, ist die Hand drauf, #Personen begrenzen (Mahnaz-Talk)
                 # im video einblenden ob geste erkannt ist oder nicht (video dimmen?)
                 # er wird mir code zukommen lassen (trian taphylos) -> "velocity from keypoints"
 
-                if len(frame.bundle) > 2:
+                # if there are more than 2 persons in this shot or no wrist is visible --> make red
+                if len(frame.bundle) > MAX_BODIES:
                     img = make_red(img)
                 if not (
                     bodies[0].get("left wrist")[2] > 0
                     or bodies[0].get("right wrist")[2] > 0
-                ):  # frame.bundle[num][bodies[0].get('right wrist')][2]
+                ):
                     img = make_red(img)
 
-                buffer.append(bodies)
+                if BUFFER_SIZE > 0:
+                    # replace current img with the one from the buffer
+                    if len(img_delay_buffer) == img_delay_buffer.maxlen:
+                        if newscene:
+                            print(f"Buffer full at {nframe}")
+                            newscene = False
 
+                        visible_bodies = [
+                            b
+                            for b in bodies
+                            if nframe - BUFFER_SIZE // 2 in b.visible_at
+                        ]
+                        visible_img = img_delay_buffer[0]
+
+                        # if you spotted a gesture --> make green
+                        gstr = False
+                        for body in visible_bodies:
+                            gstr = gstr or body.check_gestures()
+                        if gstr:
+                            visible_img = make_green(visible_img)
+
+                        show_frame(
+                            FakeFrame(
+                                {
+                                    b.num: b.buffer[BUFFER_SIZE // 2]
+                                    for b in visible_bodies
+                                },
+                                frame.cls,
+                            ),
+                            screen,
+                            skel_h5f=skel_h5f,
+                            img=visible_img,
+                        )
+
+                    # we only have to start filling the img_delay_buffer once the body-buffer is half full (we drop the first buffer_size//2 frames of every scene)
+                    if max(len(i.buffer) for i in bodies) >= bodies[0].max_buffer // 2:
+                        img_delay_buffer.append(img)
+
+                else:
+                    show_frame(frame, screen, skel_h5f=skel_h5f, img=img)
                 # breakpoint in skelshop.track.track.PoseTrack.pose_track -> the specs have a spec.prev_frame_buf_size, and that many get added to
                 # posetrack.prev_tracked, which is: FrameBuf = (collections.deque(maxlen=spec.prev_frame_buf_size)), where FrameBuf = Deque[List[TrackedPose]]
                 # trackedpose? gets filled in a complicated way.
-
-                show_frame(frame, screen, skel_h5f=skel_h5f, img=img)
+            nframe_before_scene += nframe_in_scene
 
 
 def make_red(img):
     return np.stack(
         (img[:, :, 0], img[:, :, 1], (img[:, :, 2] * 3).astype(np.uint8)), axis=-1
+    )  # np.floor_divide(img[0], 2).astype(np.uint8)
+
+
+def make_green(img):
+    return np.stack(
+        (img[:, :, 0], (img[:, :, 1] * 3), (img[:, :, 2]).astype(np.uint8)), axis=-1
     )  # np.floor_divide(img[0], 2).astype(np.uint8)
 
 
