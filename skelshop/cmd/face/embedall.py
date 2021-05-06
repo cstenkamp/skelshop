@@ -23,6 +23,7 @@ DEFAULT_THRESH_POOL = conf.DEFAULT_THRESH_POOL
 @click.argument("video", type=click.Path(exists=True))
 @click.argument("h5fn", type=click.Path())
 @click.option("--from-skels", type=click.Path(exists=True))
+# Docu - if this is given, it still uses face_detection but doesn't need to _find_ the faces using face_detection
 @click.option("--start-frame", type=int, default=0)
 @click.option(
     "--skel-thresh-pool", type=click.Choice(["min", "max", "mean"]), default=None,

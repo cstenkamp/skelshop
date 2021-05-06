@@ -3,9 +3,18 @@ from typing import Dict, Set
 from more_itertools.recipes import pairwise
 
 
+def flatten(l):
+    return [item for sublist in l for item in sublist]
+
+
 class SkeletonType:
-    def __init__(self, lines, names=None, one_sided=None):
+    def __init__(self, lines, names=None, one_sided=None, composed=False):
         self.lines = lines
+        if composed:
+            self.subskel_mapper = {
+                key: set(flatten([i for i in val.values()]))
+                for key, val in self.lines.items()
+            }
         self.names = names
         self.build_graphs()
         self.max_kp = 0
@@ -36,6 +45,10 @@ class SkeletonType:
                 self.kp_idxs.add(n1)
                 self.kp_idxs.add(n2)
 
+    def _get_subskel(self, idx):
+        if hasattr(self, "subskel_mapper"):
+            return [key for key, val in self.subskel_mapper.items() if idx in val][0]
+
     def adj(self, idx):
         return self.graph[idx]
 
@@ -50,9 +63,9 @@ class SkeletonType:
                 if other_idx not in kp_idxs:
                     continue
                 if gen_id:
-                    yield idx, (kps[idx], kps[other_idx])
+                    yield idx, (kps[idx], kps[other_idx]), self._get_subskel(idx)
                 else:
-                    yield kps[idx], kps[other_idx]
+                    yield kps[idx], kps[other_idx], self._get_subskel(idx)
 
     def iter_limb_pairs(self, kps, kp_idxs=None):
         if kp_idxs is None:
